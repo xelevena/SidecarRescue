@@ -655,12 +655,16 @@ private func runRescue(options: Options, client: SidecarClient) throws {
         // just stacks alerts. Wired stays unbounded so a late USB plug-in
         // mid-rescue can still succeed (wired failures don't surface UI).
         let wirelessFailureBudget = 1
-        // SidecarCore returns -100 ("already active") whenever a session
-        // is up *or* mid-teardown. Force-disconnecting during teardown
-        // wedges SidecarCore. So when we see -100 we simply exit cleanly
-        // and let the user press the shortcut again once teardown is
-        // done — the lock-preempt logic guarantees a second press always
-        // wins, even if a previous rescue is still around.
+        // SidecarCore returns -100 ("already active") both while a session
+        // is healthy *and* while it's mid-teardown. We don't try to tell
+        // them apart by mutating state — that's what wedged SidecarCore
+        // earlier. Instead we keep polling (cheap, read-only) on a tight
+        // interval, letting the teardown finish on its own; the next
+        // probe inside the same rescue then succeeds. After a budgeted
+        // number of consecutive -100s we assume the session is genuinely
+        // healthy and exit so we're not burning CPU forever.
+        var consecutiveAlreadyActive = 0
+        let alreadyActiveBudget = 15
 
         logLine("Starting Sidecar rescue for \(name). Timeout: \(options.timeout)s.")
         while Date() < deadline {
@@ -724,8 +728,20 @@ private func runRescue(options: Options, client: SidecarClient) throws {
             }
 
             if sawAlreadyActive {
-                logLine("Sidecar reports already-active. Exiting without touching state — press the shortcut again once the menu bar icon clears.")
-                return
+                consecutiveAlreadyActive += 1
+                if consecutiveAlreadyActive >= alreadyActiveBudget {
+                    logLine("Sidecar still reports already-active after \(consecutiveAlreadyActive) probes. Assuming healthy session; exiting.")
+                    return
+                }
+                let message = "Sidecar reports already-active (\(consecutiveAlreadyActive)/\(alreadyActiveBudget)) — waiting for teardown."
+                if attempt == 1 || message != lastSkip || consecutiveAlreadyActive.isMultiple(of: 5) {
+                    logLine("Attempt \(attempt): \(message)")
+                }
+                lastSkip = message
+                Thread.sleep(forTimeInterval: TimeInterval(options.interval))
+                continue
+            } else {
+                consecutiveAlreadyActive = 0
             }
 
             if !attemptFailures.isEmpty {
