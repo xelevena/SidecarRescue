@@ -13,7 +13,11 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "SidecarRescue",
-            path: "Sources/SidecarRescue"
+            path: "Sources/SidecarRescue",
+            linkerSettings: [
+                .linkedFramework("CoreWLAN"),
+                .linkedFramework("IOKit")
+            ]
         )
     ]
 )

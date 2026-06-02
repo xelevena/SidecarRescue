@@ -1,5 +1,9 @@
+import CoreGraphics
+import CoreWLAN
 import Darwin
 import Foundation
+import IOKit
+import IOKit.usb
 import ObjectiveC.runtime
 
 /// Set to 1 by our SIGTERM handler when a newer rescue preempts us. The
@@ -7,6 +11,41 @@ import ObjectiveC.runtime
 /// SidecarCore calls (running our `defer` blocks, releasing the lock
 /// directory) instead of being torn down mid-XPC.
 nonisolated(unsafe) var preemptRequested: sig_atomic_t = 0
+
+/// Cross-rescue state used to detect a SidecarCore wedge — a state where
+/// `connectToDevice:` keeps returning -100 ("already active") even though
+/// the iPad display is gone, typically triggered by unplugging USB-C
+/// mid-session. Within a single rescue we stay passive on -100 (mutating
+/// state mid-teardown wedges SidecarCore worse), but if a *second* shortcut
+/// press lands 15+ seconds after a previous rescue first saw -100, we know
+/// teardown is long since done — so a single bounded force-disconnect at
+/// startup is safe and breaks the wedge.
+private struct PersistentState: Codable {
+    /// Set when a rescue first observes -100 in a polling cycle. Cleared on
+    /// success, on a non-already-active outcome, or by the force-disconnect
+    /// path once it consumes the signal.
+    var alreadyActiveSeenAt: Date?
+}
+
+private enum PersistentStateStore {
+    static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/SidecarRescue/state.plist")
+
+    static func load() -> PersistentState {
+        guard let data = try? Data(contentsOf: url),
+              let state = try? PropertyListDecoder().decode(PersistentState.self, from: data) else {
+            return PersistentState()
+        }
+        return state
+    }
+
+    static func save(_ state: PersistentState) {
+        let parent = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        guard let data = try? PropertyListEncoder().encode(state) else { return }
+        try? data.write(to: url)
+    }
+}
 
 private func installPreemptionHandler() {
     // Only async-signal-safe operations are allowed inside the handler;
@@ -245,6 +284,158 @@ private enum DeviceProbe {
             }
         }
         return lines
+    }
+}
+
+/// Pre-flight checks for whether a given Sidecar transport can possibly
+/// succeed right now. The point is to avoid calling into SidecarCore when we
+/// can prove the call will fail — because the failed call spawns an
+/// "iPad unavailable" alert via SidecarRelay. CoreWLAN gives a definitive
+/// answer for the Wi-Fi side; IOKit gives a definitive answer for whether
+/// any iPad is plugged in over USB. Both are public-framework, no AppleScript.
+private enum TransportAvailability {
+    /// `true` when the Mac's Wi-Fi radio is powered on. When it's off, a
+    /// wireless `connectToDevice:` call definitely fails with -203 and
+    /// SidecarRelay surfaces that as an alert.
+    static func macWiFiPoweredOn() -> Bool {
+        // Default to `true` on any lookup failure — better to attempt and
+        // possibly get one alert than to silently skip a working transport.
+        guard let interface = CWWiFiClient.shared().interface() else { return true }
+        return interface.powerOn()
+    }
+
+    /// `true` when some Apple iPad-class device is currently enumerated on
+    /// USB. We don't try to match the exact configured device name (the USB
+    /// product string and the Sidecar device name aren't guaranteed to
+    /// match), just whether *any* iPad is plugged in.
+    static func iPadOnUSB() -> Bool {
+        let matchers: [String] = ["IOUSBHostDevice", "IOUSBDevice"]
+        for className in matchers {
+            guard let matching = IOServiceMatching(className) else { continue }
+            var iterator: io_iterator_t = 0
+            guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+                continue
+            }
+            defer { IOObjectRelease(iterator) }
+            var service = IOIteratorNext(iterator)
+            while service != 0 {
+                let current = service
+                service = IOIteratorNext(iterator)
+                defer { IOObjectRelease(current) }
+                if usbServiceLooksLikeIPad(current) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private static func usbServiceLooksLikeIPad(_ service: io_service_t) -> Bool {
+        if let product = ioRegistryString(service, key: "USB Product Name"),
+           product.localizedCaseInsensitiveContains("ipad") {
+            return true
+        }
+        if let product = ioRegistryString(service, key: "kUSBProductString"),
+           product.localizedCaseInsensitiveContains("ipad") {
+            return true
+        }
+        return false
+    }
+
+    private static func ioRegistryString(_ service: io_service_t, key: String) -> String? {
+        guard let raw = IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else {
+            return nil
+        }
+        return raw as? String
+    }
+}
+
+/// SidecarCore's `connectToDevice:` can return success without the iPad
+/// display actually materializing — SidecarRelay or SidecarDisplayAgent ends
+/// up in a half-state where it accepts the call but never delivers a session.
+/// We detect this by asking CoreGraphics whether *any* non-built-in display
+/// is currently active. For SidecarRescue's whole use case (MacBook with a
+/// broken built-in screen using an iPad as its display), a non-built-in
+/// display present means the user has a usable screen; absent means they
+/// don't, regardless of what the SidecarCore API claimed.
+private enum DisplayVerification {
+    /// `true` if at least one currently-online display is not the laptop's
+    /// built-in panel. We use the *online* list rather than the active list
+    /// so a Sidecar display set to mirror the built-in panel (the SidecarRescue
+    /// default for the broken-screen use case) still counts — mirrored
+    /// displays show up online but not active.
+    static func nonBuiltinDisplayPresent() -> Bool {
+        for display in onlineDisplays() {
+            if CGDisplayIsBuiltin(display) == 0 { return true }
+        }
+        return false
+    }
+
+    static func waitForNonBuiltinDisplay(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if nonBuiltinDisplayPresent() { return true }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return false
+    }
+
+    /// Diagnostic snapshot of every display CoreGraphics knows about, so we
+    /// can tell from the log why a ghost-success verdict was reached.
+    static func describe() -> String {
+        let displays = onlineDisplays()
+        if displays.isEmpty { return "no online displays" }
+        let parts = displays.map { display -> String in
+            let id = display
+            let builtin = CGDisplayIsBuiltin(display) != 0
+            let active = CGDisplayIsActive(display) != 0
+            let online = CGDisplayIsOnline(display) != 0
+            let inMirror = CGDisplayIsInMirrorSet(display) != 0
+            return "[id=\(id) builtin=\(builtin) active=\(active) online=\(online) mirrored=\(inMirror)]"
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private static func onlineDisplays() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else {
+            return []
+        }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &displays, &count) == .success else {
+            return []
+        }
+        return displays
+    }
+}
+
+private enum AgentReset {
+    /// Targets the user-space Sidecar agents. We deliberately don't touch
+    /// the system-level `SidecarRelay` directly via this path — launchd
+    /// will restart these user agents as soon as we SIGTERM them, and that's
+    /// usually enough to clear a ghost-success wedge. Returns the names of
+    /// processes that were actually signalled, so the caller can log it.
+    @discardableResult
+    static func resetUserspaceAgents() -> [String] {
+        let candidates = ["SidecarDisplayAgent", "SidecarRelay"]
+        var killed: [String] = []
+        for name in candidates {
+            let task = Process()
+            task.launchPath = "/usr/bin/pkill"
+            // Use SIGTERM, not SIGKILL — let the process clean up. launchd
+            // will relaunch either way; SIGTERM is gentler.
+            task.arguments = ["-x", name]
+            do {
+                try task.run()
+                task.waitUntilExit()
+                if task.terminationStatus == 0 {
+                    killed.append(name)
+                }
+            } catch {
+                // pkill not present or not allowed — best-effort, swallow.
+            }
+        }
+        return killed
     }
 }
 
@@ -645,57 +836,74 @@ private func runRescue(options: Options, client: SidecarClient) throws {
     try withSingleInstanceLock(named: "rescue.lock") {
         let name = try selectedDeviceName(options: options, client: client)
         let deadline = Date().addingTimeInterval(TimeInterval(options.timeout))
-        var attempt = 0
-        var lastSkip = ""
+
+        logLine("Starting Sidecar rescue for \(name). Timeout: \(options.timeout)s.")
+
+        // Single up-front force-disconnect to clear any state left over —
+        // healthy session, stale wedge, half-torn-down session, doesn't
+        // matter. We don't try to detect which case we're in. After this
+        // one call we leave SidecarCore alone and just wait for the
+        // device to be reachable, then connect.
+        //
+        // The earlier wedge-class bugs were caused by *multiple* mutations
+        // back-to-back during a teardown window. A single disconnect
+        // followed by read-only polling can't race itself.
+        logLine("Force-disconnect at startup to clear any leftover session state.")
+        do {
+            try client.disconnect(name: name)
+            logLine("Force-disconnect returned cleanly.")
+        } catch {
+            // Errors here usually mean there was nothing to disconnect.
+            // That's fine — we're about to wait for the device anyway.
+            logLine("Force-disconnect returned: \(error). Continuing.")
+        }
+        // Give SidecarCore time to actually finish the teardown before we
+        // start probing — connect calls inside the teardown window are what
+        // were wedging things historically.
+        Thread.sleep(forTimeInterval: 3)
+
         var wiredHopeless = false
         var wirelessHopeless = false
         var wirelessFailures = 0
-        // Wireless retries spawn "iPad unavailable" alerts. One attempt is
-        // enough — if wireless fails the first time, retrying back-to-back
-        // just stacks alerts. Wired stays unbounded so a late USB plug-in
-        // mid-rescue can still succeed (wired failures don't surface UI).
         let wirelessFailureBudget = 1
-        // SidecarCore returns -100 ("already active") both while a session
-        // is healthy *and* while it's mid-teardown. Mutating state from
-        // this path — calling disconnect to "break the wedge" — races the
-        // in-flight teardown and reliably wedges SidecarCore for the rest
-        // of the login session. So the rescue stays strictly passive on
-        // -100: poll cheaply (the connect call is read-only when it
-        // returns -100), let teardown finish on its own, and the next
-        // probe in the same loop reconnects. For the genuine stuck-state
-        // case (rare, usually from a transport switch like unplugging
-        // USB-C mid-session), the user can run `sidecar-rescue disconnect`
-        // manually rather than have the shortcut take that risk.
-        var consecutiveAlreadyActive = 0
-        let alreadyActiveBudget = 15
+        var consecutiveWiredFailures = 0
+        let wiredFailureBudget = 3
+        var attempt = 0
+        var lastSkip = ""
+        var agentResetUsed = false
 
-        logLine("Starting Sidecar rescue for \(name). Timeout: \(options.timeout)s.")
-        while Date() < deadline {
+        attemptLoop: while Date() < deadline {
             if shouldExitForPreemption() {
                 logLine("Preempted by a newer rescue press. Exiting cleanly.")
                 return
             }
             attempt += 1
 
-            // Presence check: don't invoke SidecarCore (which spawns
-            // "iPad unavailable" system alerts on failure) when the iPad is
-            // not currently visible to the Mac at all.
+            // Wait for the iPad to show up in the device list. This is a
+            // read-only call — no alerts, no state mutations.
             guard let device = (try? client.device(named: name)) ?? nil else {
-                logSkip("\(name) is not currently visible", attempt: attempt, previous: &lastSkip)
+                logSkip("\(name) not yet visible", attempt: attempt, previous: &lastSkip)
                 Thread.sleep(forTimeInterval: TimeInterval(options.interval))
-                continue
+                continue attemptLoop
             }
 
-            let reachability = client.reachability(of: device)
-            let order = transportOrder(
+            // Pre-flight: only try transports whose infrastructure (Mac Wi-Fi
+            // radio, USB-attached iPad) is actually present. Skipping
+            // impossible transports avoids the "iPad unavailable" alert
+            // SidecarRelay spawns when SidecarCore tries and fails.
+            let (order, skipReasons) = transportOrder(
                 requested: options.transport,
                 wiredHopeless: wiredHopeless,
-                wirelessHopeless: wirelessHopeless,
-                reachability: reachability
+                wirelessHopeless: wirelessHopeless
             )
             if order.isEmpty {
-                logLine("No usable transport remains for \(name). Stopping rescue early to avoid system alerts.")
-                return
+                let reason = skipReasons.isEmpty ? "no candidate transports" : skipReasons.joined(separator: "; ")
+                logSkip("no usable transport: \(reason)", attempt: attempt, previous: &lastSkip)
+                Thread.sleep(forTimeInterval: failureBackoffInterval(
+                    consecutiveFailures: consecutiveWiredFailures,
+                    baseInterval: options.interval
+                ))
+                continue attemptLoop
             }
 
             var attemptFailures: [(TransportMode, String)] = []
@@ -705,24 +913,51 @@ private func runRescue(options: Options, client: SidecarClient) throws {
                     logLine("Preempted between transports. Exiting cleanly.")
                     return
                 }
-                // If a previous transport in this iteration already returned
-                // -100, SidecarCore's manager-level "active" state will say
-                // the same thing for every other transport too. Skip the
-                // duplicate calls so we make one probe per iteration, not N.
                 if sawAlreadyActive { break }
                 do {
                     switch try client.attempt(transport, on: device) {
                     case .alreadyActive:
+                        // After the up-front disconnect, SidecarCore really
+                        // shouldn't still say -100. If it does, just wait —
+                        // teardown may not have finished yet.
                         sawAlreadyActive = true
                     case .connected(let actual):
-                        logLine("Sidecar connected via \(actual.rawValue) on attempt \(attempt).")
-                        return
+                        logLine("Sidecar connected via \(actual.rawValue) on attempt \(attempt). Verifying display materializes…")
+                        if DisplayVerification.waitForNonBuiltinDisplay(timeout: 8) {
+                            logLine("Sidecar display verified. Displays: \(DisplayVerification.describe()).")
+                            return
+                        }
+                        logLine("Display snapshot: \(DisplayVerification.describe()).")
+                        // Ghost success: SidecarCore reported connected but
+                        // no new display showed up within 8s. The wedged
+                        // agents need a kick — but only once per rescue,
+                        // and only if we haven't tried yet. After that, we
+                        // give up so we're not in an infinite kill/retry
+                        // loop on a system-wide issue.
+                        if agentResetUsed {
+                            logLine("Display still didn't appear after the agent reset. Exiting — try the shortcut again, or `sidecar-rescue disconnect` if it stays broken.")
+                            return
+                        }
+                        let killed = AgentReset.resetUserspaceAgents()
+                        logLine("Display didn't materialize (ghost success). Reset agents: \(killed.isEmpty ? "(none matched)" : killed.joined(separator: ", ")). Waiting 3s for relaunch, then retrying.")
+                        agentResetUsed = true
+                        Thread.sleep(forTimeInterval: 3)
+                        // Reset the per-transport counters so the retry
+                        // isn't tripped by stale state from this attempt.
+                        consecutiveWiredFailures = 0
+                        wiredHopeless = false
+                        wirelessHopeless = false
+                        wirelessFailures = 0
+                        continue attemptLoop
                     }
                 } catch {
                     let outcome = classify(error, attempting: transport)
                     switch transport {
                     case .wired:
-                        if outcome.transportHopeless { wiredHopeless = true }
+                        consecutiveWiredFailures += 1
+                        if outcome.transportHopeless || consecutiveWiredFailures >= wiredFailureBudget {
+                            wiredHopeless = true
+                        }
                     case .wireless:
                         wirelessFailures += 1
                         if outcome.transportHopeless || wirelessFailures >= wirelessFailureBudget {
@@ -736,20 +971,10 @@ private func runRescue(options: Options, client: SidecarClient) throws {
             }
 
             if sawAlreadyActive {
-                consecutiveAlreadyActive += 1
-                if consecutiveAlreadyActive >= alreadyActiveBudget {
-                    logLine("Sidecar still reports already-active after \(consecutiveAlreadyActive) probes. Exiting without touching state — run `sidecar-rescue disconnect --device \"\(name)\"` if the session is genuinely stuck.")
-                    return
-                }
-                let message = "Sidecar reports already-active (\(consecutiveAlreadyActive)/\(alreadyActiveBudget)) — waiting for teardown."
-                if attempt == 1 || consecutiveAlreadyActive.isMultiple(of: 5) {
-                    logLine("Attempt \(attempt): \(message)")
-                }
-                lastSkip = message
+                consecutiveWiredFailures = 0
+                logSkip("SidecarCore still reports already-active — waiting", attempt: attempt, previous: &lastSkip)
                 Thread.sleep(forTimeInterval: TimeInterval(options.interval))
-                continue
-            } else {
-                consecutiveAlreadyActive = 0
+                continue attemptLoop
             }
 
             if !attemptFailures.isEmpty {
@@ -761,44 +986,94 @@ private func runRescue(options: Options, client: SidecarClient) throws {
                 }
                 lastSkip = message
             }
-            Thread.sleep(forTimeInterval: TimeInterval(options.interval))
+            Thread.sleep(forTimeInterval: failureBackoffInterval(
+                consecutiveFailures: consecutiveWiredFailures,
+                baseInterval: options.interval
+            ))
         }
 
         throw RescueError.callbackTimedOut
     }
 }
 
-/// Writes a line to stderr, which (unlike stdout in shell redirects through
-/// `nohup … >> file`) flushes immediately so the rescue log reflects progress
-/// even when the process is short-lived.
+/// Writes a line to stderr (line-buffered through shell `>> file` redirects,
+/// so the log reflects progress even when the process is short-lived), with
+/// a timestamp prefix so individual shortcut presses can be correlated to
+/// the rescue runs they triggered.
+private let logTimestampFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return formatter
+}()
+
 private func logLine(_ message: String) {
-    FileHandle.standardError.write(Data("\(message)\n".utf8))
+    let stamped = "\(logTimestampFormatter.string(from: Date())) \(message)\n"
+    FileHandle.standardError.write(Data(stamped.utf8))
+}
+
+/// Sleep duration between failed rescue attempts. Stays at the base interval
+/// for the first few failures so a quick fix (plugging in USB-C, turning Wi-Fi
+/// on) still catches; then steps up so we don't keep firing connect calls —
+/// and the alerts they spawn — every second when nothing's reachable.
+private func failureBackoffInterval(consecutiveFailures: Int, baseInterval: Int) -> TimeInterval {
+    let base = TimeInterval(baseInterval)
+    switch consecutiveFailures {
+    case 0...3: return base
+    case 4...6: return base * 5
+    default: return base * 30
+    }
 }
 
 /// Builds the ordered list of transports to attempt this cycle, filtering
 /// out any that have already proven hopeless or that the runtime reachability
 /// probe says aren't currently usable. Returning an empty array tells the
 /// rescue loop to exit early instead of spamming SidecarCore.
+/// Returns the transports to attempt this iteration plus, for diagnostics,
+/// the reason each filtered transport was skipped. Filters are kept to the
+/// definitive infrastructure signals (CoreWLAN for Wi-Fi radio power, IOKit
+/// for whether any iPad is enumerated on USB). We deliberately do *not* use
+/// the fuzzy SidecarDevice BOOL probe here — when connectivity was just
+/// restored its flags lag behind reality, and that lag was causing the loop
+/// to skip a transport that had genuinely come back.
 private func transportOrder(
     requested: TransportMode,
     wiredHopeless: Bool,
-    wirelessHopeless: Bool,
-    reachability: Reachability
-) -> [TransportMode] {
+    wirelessHopeless: Bool
+) -> (order: [TransportMode], skipReasons: [String]) {
     let candidates: [TransportMode]
     switch requested {
     case .automatic: candidates = [.wired, .wireless]
     case .wired: candidates = [.wired]
     case .wireless: candidates = [.wireless]
     }
-    return candidates.filter { transport in
+    let wiFiPowered = TransportAvailability.macWiFiPoweredOn()
+    let iPadOnUSB = TransportAvailability.iPadOnUSB()
+
+    var order: [TransportMode] = []
+    var skipReasons: [String] = []
+    for transport in candidates {
         switch transport {
-        case .wired where wiredHopeless: return false
-        case .wireless where wirelessHopeless: return false
-        case .automatic: return false
-        default: return reachability.shouldAttempt(transport)
+        case .wired:
+            if wiredHopeless {
+                skipReasons.append("wired hopeless this run")
+            } else if !iPadOnUSB {
+                skipReasons.append("no iPad on USB (IOKit)")
+            } else {
+                order.append(.wired)
+            }
+        case .wireless:
+            if wirelessHopeless {
+                skipReasons.append("wireless hopeless this run")
+            } else if !wiFiPowered {
+                skipReasons.append("Mac Wi-Fi off (CoreWLAN)")
+            } else {
+                order.append(.wireless)
+            }
+        case .automatic:
+            break
         }
     }
+    return (order, skipReasons)
 }
 
 private func logSkip(_ message: String, attempt: Int, previous: inout String) {
@@ -856,9 +1131,14 @@ do {
             guard let device = try client.device(named: name) else {
                 throw RescueError.deviceUnavailable(name)
             }
-            let reachability = client.reachability(of: device)
-            if !reachability.shouldAttempt(options.transport) {
-                print("\(name) is not currently reachable (\(reachable(reachability))). Skipping to avoid system alerts.")
+            let (order, skipReasons) = transportOrder(
+                requested: options.transport,
+                wiredHopeless: false,
+                wirelessHopeless: false
+            )
+            if order.isEmpty {
+                let reason = skipReasons.isEmpty ? "no candidate transports" : skipReasons.joined(separator: "; ")
+                print("\(name) is not currently reachable: \(reason). Skipping to avoid system alerts.")
                 return
             }
             switch try client.connect(device: device, transport: options.transport) {
