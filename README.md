@@ -3,12 +3,13 @@ _This project was developed with assistance from OpenAI Codex._
 # SidecarRescue
 
 SidecarRescue gives a MacBook with a broken built-in screen a quick way to
-reconnect to the owner's iPad over USB and use it as a Sidecar display.
+reconnect to the owner's iPad and use it as a Sidecar display.
 
 The initial setup may require access to an external monitor or TV. After setup,
-you can take the MacBook outside with only an iPad and a data-capable USB cable:
-blind-type the Mac login password if FileVault is enabled, press a keyboard
-shortcut, and wait for the iPad to become the Mac display.
+you can take the MacBook outside with an iPad: blind-type the Mac login
+password if FileVault is enabled, press a keyboard shortcut, and wait for the
+iPad to become the Mac display. A data-capable USB cable is recommended, but
+SidecarRescue can fall back to wireless Sidecar when a cable is unavailable.
 
 Sidecar supports iPads only. An iPhone cannot be used as a Sidecar display.
 
@@ -23,18 +24,20 @@ There is no permanent background agent.
 - A Mac and iPad that support Sidecar
 - macOS 13 or later
 - Xcode command-line tooling for local builds
-- An unlocked iPad connected with a data-capable USB cable
+- An unlocked iPad
 - The Mac and iPad signed in to the same Apple Account with two-factor
   authentication enabled
-- The iPad configured to trust the Mac for USB connections
+- For wired Sidecar: a data-capable USB cable and an iPad configured to trust
+  the Mac
+- For wireless fallback: Wi-Fi, Bluetooth, and Handoff enabled
 
 ## Initial setup
 
 You may want to connect the MacBook to an external monitor or TV while
 performing the initial setup.
 
-1. Unlock the iPad, connect it to the MacBook with a USB cable, and accept the
-   trust prompt if macOS or iPadOS shows one.
+1. Unlock the iPad. For the recommended wired setup, connect it to the MacBook
+   with a USB cable and accept the trust prompt if macOS or iPadOS shows one.
 2. Start Sidecar manually once and choose the option to mirror the built-in
    display. macOS should remember the display mode for later sessions.
 3. Run the installer with the exact iPad name. The retry timeout defaults to
@@ -70,25 +73,31 @@ After restarting the MacBook with FileVault enabled:
 1. Wait for the FileVault unlock screen to load.
 2. Blind-type the Mac login password and press Return.
 3. Wait for macOS to finish logging in.
-4. Unlock the iPad and connect it to the MacBook with a USB cable.
+4. Unlock the iPad. Connect a USB cable when available.
 5. Press the assigned shortcut.
 6. Wait for the Sidecar display to appear.
 
 If the MacBook is already logged in:
 
 1. Unlock the iPad.
-2. Connect the USB cable.
+2. Connect a USB cable when available.
 3. Press the assigned shortcut.
 4. Wait for the Sidecar display to appear.
 
 The retry process exits after a successful connection. If Sidecar remains
 unavailable, it exits after three minutes.
 
+Each rescue attempt tries to force a wired Sidecar connection first. If the
+wired request fails, SidecarRescue falls back to the standard wireless Sidecar
+connection path.
+
 ## CLI
 
 ```sh
 sidecar-rescue list
+sidecar-rescue connect --device "My iPad"
 sidecar-rescue connect --device "My iPad" --wired
+sidecar-rescue connect --device "My iPad" --wireless
 sidecar-rescue disconnect --device "My iPad"
 sidecar-rescue rescue --device "My iPad" --timeout 180 --interval 3
 ```

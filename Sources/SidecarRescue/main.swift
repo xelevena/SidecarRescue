@@ -47,7 +47,13 @@ private enum RescueError: Error, CustomStringConvertible {
 
 private enum ConnectionResult {
     case alreadyActive
-    case connected
+    case connected(TransportMode)
+}
+
+private enum TransportMode: String {
+    case automatic
+    case wired
+    case wireless
 }
 
 private struct SidecarDevice {
@@ -112,16 +118,29 @@ private final class SidecarClient {
         }
     }
 
-    func connect(name: String, wired: Bool) throws -> ConnectionResult {
+    func connect(name: String, transport: TransportMode) throws -> ConnectionResult {
         let device = try matchingDevice(named: name)
 
         do {
-            if wired {
+            switch transport {
+            case .automatic:
+                do {
+                    try connectWired(device)
+                    return .connected(.wired)
+                } catch RescueError.privateFrameworkError(let error)
+                    where error.domain == "SidecarErrorDomain" && error.code == -100 {
+                    return .alreadyActive
+                } catch {
+                    try connectWireless(device)
+                    return .connected(.wireless)
+                }
+            case .wired:
                 try connectWired(device)
-            } else {
+                return .connected(.wired)
+            case .wireless:
                 try connectWireless(device)
+                return .connected(.wireless)
             }
-            return .connected
         } catch RescueError.privateFrameworkError(let error)
             where error.domain == "SidecarErrorDomain" && error.code == -100 {
             return .alreadyActive
@@ -209,7 +228,7 @@ private struct Options {
     var deviceName: String?
     var interval = 3
     var timeout = 180
-    var wired = false
+    var transport = TransportMode.automatic
 
     static func parse(_ arguments: [String]) throws -> Options {
         guard arguments.count >= 2 else {
@@ -221,7 +240,6 @@ private struct Options {
 
         var options = Options()
         options.command = arguments[1].lowercased()
-        options.wired = options.command == "rescue"
 
         var index = 2
         while index < arguments.count {
@@ -252,10 +270,10 @@ private struct Options {
                 }
                 index += 2
             case "--wired":
-                options.wired = true
+                options.transport = .wired
                 index += 1
             case "--wireless":
-                options.wired = false
+                options.transport = .wireless
                 index += 1
             case "--help", "-h":
                 throw RescueError.invalidArguments(usage)
@@ -271,12 +289,12 @@ private struct Options {
 private let usage = """
 Usage:
   sidecar-rescue list
-  sidecar-rescue connect --device "My iPad" [--wired]
+  sidecar-rescue connect --device "My iPad" [--wired | --wireless]
   sidecar-rescue disconnect --device "My iPad"
-  sidecar-rescue rescue [--device "My iPad"] [--config path] [--timeout 180] [--interval 3] [--wireless]
+  sidecar-rescue rescue [--device "My iPad"] [--config path] [--timeout 180] [--interval 3] [--wired | --wireless]
 
 The rescue command retries until Sidecar connects or the timeout expires.
-It uses a wired Sidecar session by default.
+By default, it tries a wired Sidecar session first and falls back to wireless.
 """
 
 private func configuredDeviceName(at path: String) throws -> String {
@@ -336,11 +354,11 @@ private func runRescue(options: Options, client: SidecarClient) throws {
     while Date() < deadline {
         attempt += 1
         do {
-            switch try client.connect(name: name, wired: options.wired) {
+            switch try client.connect(name: name, transport: options.transport) {
             case .alreadyActive:
                 print("A Sidecar session is already active.")
-            case .connected:
-                print("Sidecar connected on attempt \(attempt).")
+            case .connected(let transport):
+                print("Sidecar connected via \(transport.rawValue) on attempt \(attempt).")
             }
             return
         } catch {
@@ -379,8 +397,13 @@ do {
             print(device.name)
         }
     case "connect":
-        let result = try client.connect(name: requireDeviceName(options), wired: options.wired)
-        print(result == .connected ? "Sidecar connected." : "A Sidecar session is already active.")
+        let result = try client.connect(name: requireDeviceName(options), transport: options.transport)
+        switch result {
+        case .alreadyActive:
+            print("A Sidecar session is already active.")
+        case .connected(let transport):
+            print("Sidecar connected via \(transport.rawValue).")
+        }
     case "disconnect":
         try client.disconnect(name: requireDeviceName(options))
         print("Sidecar disconnected.")
