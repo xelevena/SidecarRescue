@@ -718,118 +718,141 @@ private func selectedDeviceName(options: Options, client: SidecarClient) throws 
     return onlyDevice
 }
 
+/// Holds a process-wide flock on a lock file plus the file descriptor that
+/// owns it. The kernel releases the lock automatically when this fd is
+/// closed (or the process exits, gracefully or via SIGKILL), so there's no
+/// cleanup race — unlike the earlier directory-based scheme where two
+/// concurrent preemptors could each `removeItem` then `createDirectory`
+/// and both think they held the lock.
+private final class FlockHolder {
+    let fd: Int32
+    let path: String
+    init(fd: Int32, path: String) {
+        self.fd = fd
+        self.path = path
+    }
+    deinit {
+        flock(fd, LOCK_UN)
+        close(fd)
+        // We deliberately do not unlink the lock file. Another process may
+        // be about to flock it; leaving the inode around is harmless and
+        // avoids an unlink/open race.
+    }
+}
+
+private func acquireFlock(at path: String) -> FlockHolder? {
+    let fd = open(path, O_CREAT | O_RDWR, 0o644)
+    guard fd >= 0 else { return nil }
+    if flock(fd, LOCK_EX | LOCK_NB) < 0 {
+        close(fd)
+        return nil
+    }
+    // We won the kernel-level lock. Record our PID inside the file so
+    // future preemptors know who to signal. The flock guarantees we're
+    // the only writer.
+    ftruncate(fd, 0)
+    _ = lseek(fd, 0, SEEK_SET)
+    let pidString = "\(getpid())"
+    pidString.withCString { buffer in
+        _ = write(fd, buffer, strlen(buffer))
+    }
+    return FlockHolder(fd: fd, path: path)
+}
+
+private func readFlockHolderPid(at path: String) -> pid_t? {
+    let fd = open(path, O_RDONLY)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    var buffer = [UInt8](repeating: 0, count: 32)
+    let n = buffer.withUnsafeMutableBufferPointer { ptr -> Int in
+        read(fd, ptr.baseAddress, ptr.count - 1)
+    }
+    guard n > 0 else { return nil }
+    let text = String(bytes: buffer.prefix(n), encoding: .utf8) ?? ""
+    return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+private func flockFileAge(at path: String) -> TimeInterval? {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          let modified = attrs[.modificationDate] as? Date else {
+        return nil
+    }
+    return Date().timeIntervalSince(modified)
+}
+
 private func withSingleInstanceLock(named lockName: String, body: () throws -> Void) throws {
     let applicationDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/SidecarRescue")
-    let lockDirectory = applicationDirectory.appendingPathComponent(lockName)
-    let pidFile = lockDirectory.appendingPathComponent("pid")
-
     try FileManager.default.createDirectory(
         at: applicationDirectory,
         withIntermediateDirectories: true
     )
-
-    func tryCreateLockDirectory() throws -> Bool {
-        do {
-            try FileManager.default.createDirectory(
-                at: lockDirectory,
-                withIntermediateDirectories: false
-            )
-            return true
-        } catch CocoaError.fileWriteFileExists {
-            return false
-        }
+    let lockPath = applicationDirectory.appendingPathComponent(lockName).path
+    // Clean up legacy directory-based lock from older binaries so a stale
+    // dir from before the flock switch can't shadow the file.
+    let legacyDirectory = applicationDirectory.appendingPathComponent(lockName)
+    if (try? FileManager.default.attributesOfItem(atPath: legacyDirectory.path))?[.type] as? FileAttributeType == .typeDirectory {
+        try? FileManager.default.removeItem(at: legacyDirectory)
     }
 
-    var claimed = try tryCreateLockDirectory()
-    if !claimed {
-        // Rapid-fire shortcut presses must not cascade-preempt each other —
-        // that's how the user wound up never letting any rescue finish a
-        // connect cycle. If the existing holder is still young (< 3s) the
-        // new press yields and lets it run; the user gets the result of
-        // the first press in the burst. After 3s, presses can preempt
-        // as designed, so a stuck rescue still gets cleared.
-        let holderAge = lockHolderAge(lockDirectory: lockDirectory)
-        let preemptThreshold: TimeInterval = 3
-        let holderAlive = lockHolderIsAlive(pidFile: pidFile)
-        if holderAlive, let age = holderAge, age < preemptThreshold {
-            logLine("Skipping SidecarRescue \(lockName): another rescue started \(String(format: "%.1f", age))s ago. Letting it finish.")
+    // Try to acquire the kernel-level lock. If we can't, we either yield
+    // (recent holder — protect against rapid-fire cascade preempts) or
+    // SIGTERM the holder and try again. The flock auto-releases on the
+    // holder's exit, so we don't have to manually clean up.
+    let preemptThreshold: TimeInterval = 3
+    let acquireDeadline = Date().addingTimeInterval(15)
+
+    while Date() < acquireDeadline {
+        if let holder = acquireFlock(at: lockPath) {
+            // Pin the holder's lifetime across `body()` — otherwise the
+            // optimizer can decide the local binding is dead and drop the
+            // FlockHolder (releasing the flock) before body() finishes.
+            try withExtendedLifetime(holder) { try body() }
             return
         }
-        preemptLockHolder(pidFile: pidFile, lockName: lockName)
-        try? FileManager.default.removeItem(at: lockDirectory)
-        claimed = try tryCreateLockDirectory()
-    }
-    guard claimed else {
-        logLine("Failed to acquire SidecarRescue \(lockName).")
-        return
-    }
 
-    try? Data("\(getpid())".utf8).write(to: pidFile)
-    defer {
-        try? FileManager.default.removeItem(at: lockDirectory)
-    }
-    try body()
-}
+        // Someone holds it. Read their PID and decide.
+        let holderPid = readFlockHolderPid(at: lockPath)
+        let age = flockFileAge(at: lockPath)
 
-private func lockHolderAge(lockDirectory: URL) -> TimeInterval? {
-    guard let attrs = try? FileManager.default.attributesOfItem(atPath: lockDirectory.path),
-          let created = attrs[.creationDate] as? Date else {
-        return nil
-    }
-    return Date().timeIntervalSince(created)
-}
-
-private func lockHolderIsAlive(pidFile: URL) -> Bool {
-    guard let raw = try? String(contentsOf: pidFile, encoding: .utf8),
-          let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-          pid > 0 else {
-        return false
-    }
-    return kill(pid, 0) == 0
-}
-
-private func preemptLockHolder(pidFile: URL, lockName: String) {
-    guard let raw = try? String(contentsOf: pidFile, encoding: .utf8),
-          let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-          pid > 0 else {
-        return
-    }
-    if kill(pid, 0) != 0 {
-        // Already gone; nothing to preempt.
-        return
-    }
-    logLine("Preempting existing SidecarRescue \(lockName) (pid \(pid)).")
-    // SIGTERM hands off to the in-process handler, which flips the preempt
-    // flag. The target's rescue loop notices it at the next iteration
-    // boundary, returns through its withSingleInstanceLock body, runs the
-    // defer that removes the lock directory, and exits cleanly. We poll
-    // here until the process is actually gone, so we never race with its
-    // teardown or end up with overlapping lock-directory state.
-    _ = kill(pid, SIGTERM)
-    // Wait up to 6 seconds for the graceful exit. That covers a worst-case
-    // 30s callback wait inside SidecarCore being interrupted plus a sleep
-    // boundary; in practice the loop wakes within one --interval (1s).
-    let gracefulDeadline = Date().addingTimeInterval(6)
-    while Date() < gracefulDeadline {
-        if kill(pid, 0) != 0 && errno == ESRCH {
-            // Process exited; its `defer` has already removed the lock dir.
-            return
+        if let pid = holderPid, kill(pid, 0) == 0 {
+            // Live holder.
+            if let age, age < preemptThreshold {
+                logLine("Skipping SidecarRescue \(lockName): another rescue started \(String(format: "%.1f", age))s ago. Letting it finish.")
+                return
+            }
+            // Preempt and wait — once the target exits, the kernel releases
+            // its flock, and our next acquireFlock will succeed.
+            logLine("Preempting existing SidecarRescue \(lockName) (pid \(pid)).")
+            _ = kill(pid, SIGTERM)
+            let gracefulDeadline = Date().addingTimeInterval(6)
+            while Date() < gracefulDeadline {
+                if let holder = acquireFlock(at: lockPath) {
+                    try withExtendedLifetime(holder) { try body() }
+                    return
+                }
+                if kill(pid, 0) != 0 && errno == ESRCH { break }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            // Didn't release within 6s. Escalate.
+            if kill(pid, 0) == 0 {
+                logLine("Preempted holder did not exit within 6s; escalating to SIGKILL.")
+                _ = kill(pid, SIGKILL)
+            }
+            // Loop back and retry acquireFlock; SIGKILL closes the fd and
+            // releases the lock.
+            Thread.sleep(forTimeInterval: 0.2)
+            continue
+        } else {
+            // Holder PID is dead but lock looks held. The kernel should have
+            // released the flock on exit; this can briefly happen during the
+            // exit window. Retry shortly.
+            Thread.sleep(forTimeInterval: 0.1)
+            continue
         }
-        Thread.sleep(forTimeInterval: 0.1)
     }
-    // Holder ignored SIGTERM (stuck in an uninterruptible syscall, most
-    // likely). Escalate so we don't leave a stale lock around. SIGKILL
-    // skips the defer, so we'll have to clean up the lock dir ourselves
-    // in the caller.
-    logLine("Preempted holder did not exit within 6s; escalating to SIGKILL.")
-    _ = kill(pid, SIGKILL)
-    // Brief wait for the kernel to reap the PID so subsequent kill(0)
-    // probes don't transiently report the zombie as alive.
-    for _ in 0..<10 {
-        if kill(pid, 0) != 0 && errno == ESRCH { return }
-        Thread.sleep(forTimeInterval: 0.1)
-    }
+
+    logLine("Failed to acquire SidecarRescue \(lockName) within 15s.")
 }
 
 private func runRescue(options: Options, client: SidecarClient) throws {
