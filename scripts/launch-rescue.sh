@@ -14,4 +14,4 @@ fi
 exec "${APP_DIR}/bin/sidecar-rescue" rescue \
   --config "${CONFIG_FILE}" \
   --timeout "${TIMEOUT_SECONDS}" \
-  --interval 3 >> "${LOG_FILE}" 2>&1
+  --interval 1 >> "${LOG_FILE}" 2>&1

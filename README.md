@@ -95,12 +95,20 @@ connection path.
 
 ```sh
 sidecar-rescue list
+sidecar-rescue inspect [--device "My iPad"]
 sidecar-rescue connect --device "My iPad"
 sidecar-rescue connect --device "My iPad" --wired
 sidecar-rescue connect --device "My iPad" --wireless
 sidecar-rescue disconnect --device "My iPad"
 sidecar-rescue rescue --device "My iPad" --timeout 180 --interval 3
 ```
+
+Before calling into SidecarCore, both `connect` and `rescue` probe the iPad
+for transport reachability via the Objective-C runtime. If the requested
+transport is known to be unavailable, the call is skipped so macOS does not
+surface repeated "iPad unavailable" alerts. Use `inspect` to print the
+SidecarCore device class, its properties, and the reachability flags
+SidecarRescue is reading.
 
 ## Uninstall
 
