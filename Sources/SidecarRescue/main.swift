@@ -656,13 +656,16 @@ private func runRescue(options: Options, client: SidecarClient) throws {
         // mid-rescue can still succeed (wired failures don't surface UI).
         let wirelessFailureBudget = 1
         // SidecarCore returns -100 ("already active") both while a session
-        // is healthy *and* while it's mid-teardown. We don't try to tell
-        // them apart by mutating state — that's what wedged SidecarCore
-        // earlier. Instead we keep polling (cheap, read-only) on a tight
-        // interval, letting the teardown finish on its own; the next
-        // probe inside the same rescue then succeeds. After a budgeted
-        // number of consecutive -100s we assume the session is genuinely
-        // healthy and exit so we're not burning CPU forever.
+        // is healthy *and* while it's mid-teardown. Mutating state from
+        // this path — calling disconnect to "break the wedge" — races the
+        // in-flight teardown and reliably wedges SidecarCore for the rest
+        // of the login session. So the rescue stays strictly passive on
+        // -100: poll cheaply (the connect call is read-only when it
+        // returns -100), let teardown finish on its own, and the next
+        // probe in the same loop reconnects. For the genuine stuck-state
+        // case (rare, usually from a transport switch like unplugging
+        // USB-C mid-session), the user can run `sidecar-rescue disconnect`
+        // manually rather than have the shortcut take that risk.
         var consecutiveAlreadyActive = 0
         let alreadyActiveBudget = 15
 
@@ -702,6 +705,11 @@ private func runRescue(options: Options, client: SidecarClient) throws {
                     logLine("Preempted between transports. Exiting cleanly.")
                     return
                 }
+                // If a previous transport in this iteration already returned
+                // -100, SidecarCore's manager-level "active" state will say
+                // the same thing for every other transport too. Skip the
+                // duplicate calls so we make one probe per iteration, not N.
+                if sawAlreadyActive { break }
                 do {
                     switch try client.attempt(transport, on: device) {
                     case .alreadyActive:
@@ -730,11 +738,11 @@ private func runRescue(options: Options, client: SidecarClient) throws {
             if sawAlreadyActive {
                 consecutiveAlreadyActive += 1
                 if consecutiveAlreadyActive >= alreadyActiveBudget {
-                    logLine("Sidecar still reports already-active after \(consecutiveAlreadyActive) probes. Assuming healthy session; exiting.")
+                    logLine("Sidecar still reports already-active after \(consecutiveAlreadyActive) probes. Exiting without touching state — run `sidecar-rescue disconnect --device \"\(name)\"` if the session is genuinely stuck.")
                     return
                 }
                 let message = "Sidecar reports already-active (\(consecutiveAlreadyActive)/\(alreadyActiveBudget)) — waiting for teardown."
-                if attempt == 1 || message != lastSkip || consecutiveAlreadyActive.isMultiple(of: 5) {
+                if attempt == 1 || consecutiveAlreadyActive.isMultiple(of: 5) {
                     logLine("Attempt \(attempt): \(message)")
                 }
                 lastSkip = message
